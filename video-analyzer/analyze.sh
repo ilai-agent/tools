@@ -79,8 +79,27 @@ if [ -f "$VIDEO_FILE" ]; then
 else
     "$YT_DLP" -f "best[ext=mp4]/best" -o "$VIDEO_FILE" "$URL" 2>&1 | tail -3
     if [ ! -f "$VIDEO_FILE" ]; then
-        echo "Error: Download failed." >&2
-        exit 1
+        echo "  -> yt-dlp failed, trying loader.to fallback..."
+        # Fallback: use loader.to API (works from datacenter IPs where yt-dlp is blocked)
+        ENCODED_URL=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$URL', safe=''))")
+        LOADER_RESP=$(curl -s "https://loader.to/ajax/download.php?format=mp4&url=${ENCODED_URL}")
+        DOWNLOAD_ID=$(echo "$LOADER_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)
+        if [ -n "$DOWNLOAD_ID" ]; then
+            echo "  -> Waiting for conversion (id: $DOWNLOAD_ID)..."
+            for i in $(seq 1 60); do
+                sleep 3
+                PROGRESS=$(curl -s "https://loader.to/ajax/progress.php?id=$DOWNLOAD_ID")
+                DL_URL=$(echo "$PROGRESS" | python3 -c "import json,sys; d=json.load(sys.stdin); u=d.get('download_url',''); print(u if u and u not in ['None',''] else '')" 2>/dev/null || true)
+                if [ -n "$DL_URL" ]; then
+                    curl -L -o "$VIDEO_FILE" "$DL_URL" 2>/dev/null
+                    break
+                fi
+            done
+        fi
+        if [ ! -f "$VIDEO_FILE" ]; then
+            echo "Error: All download methods failed." >&2
+            exit 1
+        fi
     fi
 fi
 echo "  -> Done: $(du -h "$VIDEO_FILE" | cut -f1)"
