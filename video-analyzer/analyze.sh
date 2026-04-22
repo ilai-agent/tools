@@ -1,5 +1,9 @@
 #!/bin/bash
-# Video Analyzer — Full pipeline: download → metadata → audio extract → transcribe → key frames
+# Video Analyzer — Full pipeline: download → metadata → audio extract → transcribe (SRT) → Claude AI analysis
+#
+# AI Analysis (step 5): Claude CLI reads the transcript, selects key frames where visual
+# references are made ("look at this", "תראה", "כאן", etc.), extracts those frames with
+# ffmpeg, and writes a summary.md.  This replaces the old deterministic smart_frames.py.
 #
 # Usage:
 #   ./analyze.sh <URL> [--output-dir DIR] [--language LANG] [--no-transcribe] [--no-frames]
@@ -7,14 +11,20 @@
 # Examples:
 #   ./analyze.sh "https://www.loom.com/share/abc123"
 #   ./analyze.sh "https://youtu.be/xyz" --language en --output-dir /tmp/out
-#   ./analyze.sh "https://www.loom.com/share/abc123" --no-transcribe
+#   ./analyze.sh "https://www.loom.com/share/abc123" --no-frames   # summary only, no frames
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 YT_DLP="$SCRIPT_DIR/bin/yt-dlp"
-TRANSCRIBE="$SCRIPT_DIR/transcribe.sh"
-FFMPEG="${FFMPEG_PATH:-$(command -v ffmpeg 2>/dev/null || echo "$HOME/.local/bin/ffmpeg")}"
+# Prefer bundled ffmpeg (newer, tested with fHLS) → system PATH → ~/.local
+FFMPEG="${FFMPEG_PATH:-$SCRIPT_DIR/bin/ffmpeg}"
+if [ ! -x "$FFMPEG" ]; then
+    FFMPEG="$(command -v ffmpeg 2>/dev/null || echo "$HOME/.local/bin/ffmpeg")"
+fi
+WHISPER_BIN="${WHISPER_BIN:-$HOME/whisper.cpp/build/bin/whisper-cli}"
+WHISPER_MODELS="${WHISPER_MODELS:-$HOME/whisper.cpp/models}"
+WHISPER_MODEL="${WHISPER_MODEL:-ggml-small.bin}"
 
 # --- Defaults ---
 LANGUAGE="he"
@@ -60,7 +70,6 @@ fi
 
 # --- Setup output directory ---
 if [ -z "$OUTPUT_DIR" ]; then
-    # Extract video ID from URL for directory name
     VIDEO_ID=$(echo "$URL" | grep -oP '[a-f0-9]{32}|[a-zA-Z0-9_-]{11}' | head -1 || echo "video")
     OUTPUT_DIR="/home/agent/agents/github-agent/video-analyze/output/$VIDEO_ID"
 fi
@@ -119,138 +128,207 @@ if [ -f "$AUDIO_FILE" ]; then
 fi
 echo ""
 
-# --- Step 4: Transcribe (with timestamps) ---
+# --- Step 4: Transcribe with timestamps (SRT + plain text) ---
 echo "[4/5] Transcribing..."
 TRANSCRIPT_FILE="$OUTPUT_DIR/transcript.txt"
+TRANSCRIPT_SRT="$OUTPUT_DIR/transcript.srt"
+
 if [ "$DO_TRANSCRIBE" -eq 0 ]; then
     echo "  -> Skipped."
-elif [ -f "$TRANSCRIPT_FILE" ]; then
-    echo "  -> Already transcribed, skipping."
+elif [ -f "$TRANSCRIPT_SRT" ]; then
+    echo "  -> Already transcribed (SRT), skipping."
 else
-    if [ -x "$TRANSCRIBE" ]; then
-        "$TRANSCRIBE" "$AUDIO_FILE" --language "$LANGUAGE" > "$TRANSCRIPT_FILE" 2>/dev/null || {
+    if [ ! -f "$WHISPER_BIN" ]; then
+        echo "  -> whisper-cli not found at $WHISPER_BIN, skipping." >&2
+        DO_TRANSCRIBE=0
+    elif [ ! -f "$WHISPER_MODELS/$WHISPER_MODEL" ]; then
+        echo "  -> Whisper model not found at $WHISPER_MODELS/$WHISPER_MODEL, skipping." >&2
+        DO_TRANSCRIBE=0
+    else
+        # Whisper saves output files next to the audio file using -of <base> flag.
+        TRANSCRIPT_BASE="$OUTPUT_DIR/transcript"
+        "$WHISPER_BIN" \
+            -m "$WHISPER_MODELS/$WHISPER_MODEL" \
+            -l "$LANGUAGE" \
+            -f "$AUDIO_FILE" \
+            -osrt \
+            -otxt \
+            -of "$TRANSCRIPT_BASE" \
+            2>/dev/null || true
+
+        if [ -f "${TRANSCRIPT_BASE}.srt" ]; then
+            mv "${TRANSCRIPT_BASE}.srt" "$TRANSCRIPT_SRT"
+        fi
+        if [ -f "${TRANSCRIPT_BASE}.txt" ]; then
+            mv "${TRANSCRIPT_BASE}.txt" "$TRANSCRIPT_FILE"
+        fi
+
+        # Fallback: if whisper wrote to stdout only (older builds), capture that
+        if [ ! -f "$TRANSCRIPT_SRT" ] && [ ! -f "$TRANSCRIPT_FILE" ]; then
+            "$WHISPER_BIN" \
+                -m "$WHISPER_MODELS/$WHISPER_MODEL" \
+                -l "$LANGUAGE" \
+                -f "$AUDIO_FILE" \
+                2>/dev/null > "$TRANSCRIPT_FILE" || true
+        fi
+
+        if [ -f "$TRANSCRIPT_SRT" ]; then
+            ENTRY_COUNT=$(grep -c '^[0-9]\+$' "$TRANSCRIPT_SRT" 2>/dev/null || echo "0")
+            echo "  -> Done: $ENTRY_COUNT subtitle entries with timestamps (SRT)"
+        elif [ -f "$TRANSCRIPT_FILE" ]; then
+            WORD_COUNT=$(wc -w < "$TRANSCRIPT_FILE")
+            echo "  -> Done: $WORD_COUNT words (plain text, no timestamps)"
+        else
             echo "  -> Transcription failed." >&2
             DO_TRANSCRIBE=0
-        }
-        if [ "$DO_TRANSCRIBE" -eq 1 ] && [ -s "$TRANSCRIPT_FILE" ]; then
-            WORD_COUNT=$(wc -w < "$TRANSCRIPT_FILE")
-            echo "  -> Done: $WORD_COUNT words (with timestamps)"
         fi
-    else
-        echo "  -> transcribe.sh not found at $TRANSCRIBE, skipping."
     fi
 fi
 echo ""
 
-# --- Step 5: Extract key frames (scene-change detection) ---
-echo "[5/5] Extracting key frames..."
-if [ "$DO_FRAMES" -eq 0 ]; then
-    echo "  -> Skipped."
+# --- Step 5: Claude AI Analysis (frame selection + summary) ---
+echo "[5/5] Running Claude AI analysis (frame selection + summary)..."
+
+# Determine available transcript
+TRANSCRIPT_SOURCE=""
+if [ -f "$TRANSCRIPT_SRT" ]; then
+    TRANSCRIPT_SOURCE="$TRANSCRIPT_SRT"
+elif [ -f "$TRANSCRIPT_FILE" ]; then
+    TRANSCRIPT_SOURCE="$TRANSCRIPT_FILE"
+fi
+
+if [ -z "$TRANSCRIPT_SOURCE" ]; then
+    echo "  -> No transcript available — skipping AI analysis."
+    echo "     (Re-run without --no-transcribe to enable AI analysis.)"
+elif ! command -v claude &>/dev/null; then
+    echo "  -> claude CLI not found — skipping AI analysis." >&2
 else
-    MANIFEST="$OUTPUT_DIR/frames/manifest.txt"
-    FRAME_COUNT=$(ls "$OUTPUT_DIR/frames/"*.jpg 2>/dev/null | wc -l)
-    if [ "$FRAME_COUNT" -gt 0 ]; then
-        echo "  -> Already extracted ($FRAME_COUNT frames), skipping."
+    # Build prompt in a temp file to avoid shell argument length limits
+    PROMPT_FILE=$(mktemp /tmp/va_prompt_XXXXXX.txt)
+
+    cat > "$PROMPT_FILE" << 'PROMPT_END'
+You are analyzing a video transcript. Perform two tasks:
+
+TASK 1 — Frame selection:
+Read the transcript carefully and identify timestamps where the speaker makes a visual
+reference — moments where seeing the screen is important to understand what they mean.
+Look for: pointing words ("here", "this", "כאן", "זה"), demonstration phrases
+("as I'm doing now", "כמו שאני עושה", "watch", "תראה"), screen references
+("see this button", "notice the", "שים לב ל"), etc.
+Only select timestamps that genuinely benefit from a screenshot. Skip pure narration.
+
+TASK 2 — Summary:
+Write a concise, informative summary of the video content (2-4 paragraphs).
+Cover the main topic, key points, and any conclusions or action items.
+
+Output EXACTLY this format — nothing before FRAMES_JSON, nothing after the summary,
+no markdown code fences:
+
+FRAMES_JSON:
+[
+  {"timestamp": "HH:MM:SS", "reason": "short reason why this frame helps"},
+  {"timestamp": "HH:MM:SS", "reason": "short reason why this frame helps"}
+]
+SUMMARY:
+Your summary here. Multiple paragraphs are fine.
+
+If there are no visual references, use an empty array:
+FRAMES_JSON:
+[]
+SUMMARY:
+Your summary here.
+
+Here is the transcript:
+---
+PROMPT_END
+
+    cat "$TRANSCRIPT_SOURCE" >> "$PROMPT_FILE"
+
+    echo "  -> Sending transcript to Claude (may take ~30s)..."
+    CLAUDE_OUTPUT_FILE="$OUTPUT_DIR/claude_output.txt"
+
+    if claude -p "$(cat "$PROMPT_FILE")" \
+        --dangerously-skip-permissions \
+        --output-format text \
+        > "$CLAUDE_OUTPUT_FILE" 2>/dev/null; then
+
+        echo "  -> Claude analysis complete."
+
+        # Parse Claude output with Python
+        TIMESTAMPS_FILE="$OUTPUT_DIR/.frame_timestamps.txt"
+        python3 - "$CLAUDE_OUTPUT_FILE" "$OUTPUT_DIR/summary.md" "$TIMESTAMPS_FILE" << 'PYEOF'
+import sys, re, json
+
+output_file = sys.argv[1]
+summary_path = sys.argv[2]
+timestamps_path = sys.argv[3]
+
+with open(output_file) as f:
+    content = f.read()
+
+# Extract FRAMES_JSON block
+frames = []
+frames_match = re.search(r'FRAMES_JSON:\s*(\[.*?\])', content, re.DOTALL)
+if frames_match:
+    try:
+        frames = json.loads(frames_match.group(1))
+    except json.JSONDecodeError as e:
+        print(f"  -> Warning: could not parse FRAMES_JSON: {e}", file=sys.stderr)
+
+# Extract SUMMARY block
+summary = ""
+summary_match = re.search(r'SUMMARY:\s*(.*)', content, re.DOTALL)
+if summary_match:
+    summary = summary_match.group(1).strip()
+
+# Save summary
+if summary:
+    with open(summary_path, "w") as f:
+        f.write(summary)
+    word_count = len(summary.split())
+    print(f"  -> Summary saved ({word_count} words)")
+else:
+    print("  -> Warning: no SUMMARY found in Claude output", file=sys.stderr)
+
+# Save timestamps
+if frames:
+    with open(timestamps_path, "w") as f:
+        for item in frames:
+            ts = item.get("timestamp", "").strip()
+            reason = item.get("reason", "").strip().replace("|", " ")
+            if ts:
+                f.write(f"{ts}|{reason}\n")
+    print(f"  -> {len(frames)} visual reference timestamps selected")
+else:
+    print("  -> No visual references found — no frames to extract")
+PYEOF
+
+        # Extract frames using Claude's selected timestamps
+        if [ "$DO_FRAMES" -eq 1 ] && [ -f "$TIMESTAMPS_FILE" ] && [ -s "$TIMESTAMPS_FILE" ] && [ -f "$VIDEO_FILE" ]; then
+            FRAME_COUNT=0
+            > "$OUTPUT_DIR/frames/manifest.txt"  # clear manifest
+            while IFS='|' read -r TS REASON; do
+                [ -z "$TS" ] && continue
+                TS_SAFE="${TS//:/-}"
+                FRAME_FILE="$OUTPUT_DIR/frames/frame_${TS_SAFE}.jpg"
+                if "$FFMPEG" -ss "$TS" -i "$VIDEO_FILE" -frames:v 1 -q:v 2 "$FRAME_FILE" -y 2>/dev/null; then
+                    echo "${TS} — ${REASON}" >> "$OUTPUT_DIR/frames/manifest.txt"
+                    FRAME_COUNT=$((FRAME_COUNT + 1))
+                else
+                    echo "  -> Warning: failed to extract frame at $TS" >&2
+                fi
+            done < "$TIMESTAMPS_FILE"
+            rm -f "$TIMESTAMPS_FILE"
+            echo "  -> Extracted $FRAME_COUNT frames"
+        elif [ "$DO_FRAMES" -eq 0 ]; then
+            echo "  -> Frame extraction skipped (--no-frames)."
+        fi
+
     else
-        # Strategy: scene-change detection with 12% threshold.
-        # Extracts only frames that differ significantly from the previous one.
-        # Then enforces minimum 3-second gap to avoid bursts.
-        #
-        # Filenames encode the timestamp: frame_01m25s.jpg
-        # manifest.txt maps timestamp → filename for sync with transcript.
-
-        # Step 5a: Extract scene-change frames + collect their timestamps
-        SCENE_LOG="$OUTPUT_DIR/frames/.scene_detect.log"
-        "$FFMPEG" -i "$VIDEO_FILE" \
-            -vf "select='gt(scene,0.12)',showinfo" \
-            -vsync vfr -q:v 3 \
-            "$OUTPUT_DIR/frames/raw_%06d.jpg" -y 2>&1 \
-            | grep "showinfo" > "$SCENE_LOG" 2>/dev/null || true
-
-        RAW_COUNT=$(ls "$OUTPUT_DIR/frames/raw_"*.jpg 2>/dev/null | wc -l)
-        rm -f "$MANIFEST"
-
-        if [ "$RAW_COUNT" -gt 0 ]; then
-            # Parse timestamps from showinfo log: pts_time:123.456
-            TIMESTAMPS=$(grep -oP 'pts_time:\K[0-9.]+' "$SCENE_LOG" 2>/dev/null || true)
-
-            if [ -n "$TIMESTAMPS" ]; then
-                # Rename with timestamps + enforce 3s minimum gap
-                PREV_SECS=-10
-                IDX=1
-                for RAW_TS in $TIMESTAMPS; do
-                    SECS=$(printf "%.0f" "$RAW_TS")
-
-                    # Enforce minimum 3-second gap
-                    DIFF=$((SECS - PREV_SECS))
-                    if [ "$DIFF" -lt 3 ] && [ "$PREV_SECS" -ge 0 ]; then
-                        rm -f "$OUTPUT_DIR/frames/raw_$(printf '%06d' $IDX).jpg"
-                        IDX=$((IDX + 1))
-                        continue
-                    fi
-
-                    RAW_FILE="$OUTPUT_DIR/frames/raw_$(printf '%06d' $IDX).jpg"
-                    if [ ! -f "$RAW_FILE" ]; then
-                        IDX=$((IDX + 1))
-                        continue
-                    fi
-
-                    MINS=$((SECS / 60))
-                    RSECS=$((SECS % 60))
-                    TS=$(printf "%02dm%02ds" "$MINS" "$RSECS")
-                    PRETTY=$(printf "%02d:%02d" "$MINS" "$RSECS")
-
-                    mv "$RAW_FILE" "$OUTPUT_DIR/frames/frame_${TS}.jpg"
-                    echo "$PRETTY  frame_${TS}.jpg" >> "$MANIFEST"
-
-                    PREV_SECS=$SECS
-                    IDX=$((IDX + 1))
-                done
-            else
-                # Timestamps not parsed — rename sequentially
-                IDX=0
-                for F in "$OUTPUT_DIR/frames/raw_"*.jpg; do
-                    [ -f "$F" ] || continue
-                    SECS=$((IDX * 5))
-                    MINS=$((SECS / 60))
-                    RSECS=$((SECS % 60))
-                    TS=$(printf "%02dm%02ds" "$MINS" "$RSECS")
-                    PRETTY=$(printf "%02d:%02d" "$MINS" "$RSECS")
-                    mv "$F" "$OUTPUT_DIR/frames/frame_${TS}.jpg"
-                    echo "$PRETTY  frame_${TS}.jpg" >> "$MANIFEST"
-                    IDX=$((IDX + 1))
-                done
-            fi
-        else
-            # Fallback: scene detection produced 0 frames — use interval sampling (1 per 5 seconds)
-            echo "  -> Scene detection found 0 changes, falling back to 1 frame / 5 seconds..."
-            "$FFMPEG" -i "$VIDEO_FILE" \
-                -vf "fps=1/5" -q:v 3 \
-                "$OUTPUT_DIR/frames/raw_%06d.jpg" -y 2>/dev/null
-
-            IDX=0
-            for F in "$OUTPUT_DIR/frames/raw_"*.jpg; do
-                [ -f "$F" ] || continue
-                SECS=$((IDX * 5))
-                MINS=$((SECS / 60))
-                RSECS=$((SECS % 60))
-                TS=$(printf "%02dm%02ds" "$MINS" "$RSECS")
-                PRETTY=$(printf "%02d:%02d" "$MINS" "$RSECS")
-                mv "$F" "$OUTPUT_DIR/frames/frame_${TS}.jpg"
-                echo "$PRETTY  frame_${TS}.jpg" >> "$MANIFEST"
-                IDX=$((IDX + 1))
-            done
-        fi
-
-        # Clean up
-        rm -f "$OUTPUT_DIR/frames/raw_"*.jpg "$SCENE_LOG"
-
-        FRAME_COUNT=$(ls "$OUTPUT_DIR/frames/"*.jpg 2>/dev/null | wc -l)
-        echo "  -> Done: $FRAME_COUNT key frames (scene-change detection, min 3s gap)"
-        if [ -f "$MANIFEST" ]; then
-            echo "  -> Manifest: $MANIFEST"
-        fi
+        echo "  -> Claude CLI returned an error — AI analysis skipped." >&2
     fi
+
+    rm -f "$PROMPT_FILE"
 fi
 echo ""
 
@@ -259,14 +337,21 @@ echo "=== Analysis Complete ==="
 echo "Output directory: $OUTPUT_DIR"
 echo ""
 echo "Files:"
-ls -lh "$OUTPUT_DIR/" | grep -v "^total" | grep -v "^d" | awk '{print "  " $NF " (" $5 ")"}'
+ls -lh "$OUTPUT_DIR/" 2>/dev/null | grep -v "^total" | grep -v "^d" | awk '{print "  " $NF " (" $5 ")"}'
 echo ""
 if [ -d "$OUTPUT_DIR/frames" ]; then
     FC=$(ls "$OUTPUT_DIR/frames/"*.jpg 2>/dev/null | wc -l)
     echo "  frames/ ($FC key frames)"
-    if [ -f "$OUTPUT_DIR/frames/manifest.txt" ]; then
-        echo "  manifest.txt — timestamp → frame mapping"
+    if [ -f "$OUTPUT_DIR/frames/manifest.txt" ] && [ -s "$OUTPUT_DIR/frames/manifest.txt" ]; then
+        echo ""
+        echo "Frame manifest:"
+        cat "$OUTPUT_DIR/frames/manifest.txt"
     fi
+fi
+if [ -f "$OUTPUT_DIR/summary.md" ]; then
+    echo ""
+    echo "--- Summary ---"
+    cat "$OUTPUT_DIR/summary.md"
 fi
 echo ""
 echo "Done."
