@@ -46,6 +46,19 @@ In Claude Code:
 
 The skill auto-triggers when you share a Loom or YouTube URL and ask to "analyze", "summarize", or "transcribe" it. No need to type `/analyze-video` explicitly.
 
+## YouTube on VPS / Cloud Servers
+
+> ⚠️ **If running on a VPS or cloud server**, YouTube blocks datacenter IP addresses and returns `LOGIN_REQUIRED` errors. This does **not** affect local machines (laptop/desktop).
+
+**Fix: provide browser cookies.**
+
+1. Install the [Get cookies.txt LOCALLY](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) Chrome extension (or equivalent for Firefox).
+2. Go to [youtube.com](https://youtube.com) while logged in to your Google account.
+3. Click the extension → **Export** → save as `cookies.txt`.
+4. Place the file at `~/.config/yt-dlp/cookies.txt` on the server.
+
+yt-dlp will pick it up automatically. Cookies are typically valid for **1–3 months** before needing renewal.
+
 ## Dependencies
 
 All must be pre-installed on the machine:
